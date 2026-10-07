@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import time
 
 app = Flask(__name__)
@@ -8,14 +9,26 @@ rate_limit_storage = {}
 MAX_REQUESTS = 5
 TIME_WINDOW = 10
 
+CORS(app, resources={
+    r"/api/*" : {
+        "origins" : "http://localhost:8080",
+        "methods" : ["GET", "POST", "OPTIONS"],
+        "allow_headers" : ["Content-Type", "x-api-key"]
+    }
+})
+
 @app.before_request
 def check_rate_limit():
+    if request.method == 'OPTIONS':
+        return None
+
     api_key = request.headers.get('x-api-key')
     client_id = api_key if api_key else request.remote_addr #địa chỉ ip của client gửi request
     #ý nghĩa dòng trên là Ưu tiên nhận diện người dùng bằng API Key. Nếu không có API Key thì nhận diện bằng IP
 
 
     current_time = time.time()
+    #trường hợp nếu user mới tạo request đầu
     if client_id not in rate_limit_storage:
         rate_limit_storage[client_id] = {"count": 1, "start_time": current_time}
         return None     #Cho phép request đi tiếp
@@ -37,6 +50,8 @@ def check_rate_limit():
             }), 429
 
     return None
+
+
 
 
 @app.route('/api/data', methods = ['GET'])
