@@ -1,131 +1,271 @@
+import os
+import hashlib
+import ipaddress
+from urllib.parse import urlsplit
+
+import redis
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import time
-import re
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
+app.config["DEBUG"] = False
 
-rate_limit_storage = {}
+TRUSTED_X_FOR_COUNT = max(0, int(os.getenv("TRUSTED_X_FOR_COUNT", "0")))
+TRUSTED_X_PROTO_COUNT = max(0, int(os.getenv("TRUSTED_X_PROTO_COUNT", "0")))
 
-MAX_REQUESTS = 5
-TIME_WINDOW = 10
+app.wsgi_app = ProxyFix(
+    app.wsgi_app,
+    x_for=TRUSTED_X_FOR_COUNT,
+    x_proto=TRUSTED_X_PROTO_COUNT
+)
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+redis_client = redis.Redis.from_url(
+    REDIS_URL,
+    decode_responses=True,
+    socket_connect_timeout=1,
+    socket_timeout=1,
+    health_check_interval=30,
+    max_connections=50
+)
+
+MAX_REQUESTS = max(1, int(os.getenv("MAX_REQUESTS", "5")))
+TIME_WINDOW = max(1, int(os.getenv("TIME_WINDOW", "10")))
+
+SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+STATE_CHANGING_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
 
 
-ALLOWED_ORIGINS = ["http://localhost:8080"]
+def normalize_origin(value, allow_path=False):
+    try:
+        parsed = urlsplit(value.strip())
+
+        scheme = parsed.scheme.lower()
+
+        if scheme not in {"http", "https"}:
+            return None
+
+        if not parsed.hostname:
+            return None
+
+        if parsed.username is not None or parsed.password is not None:
+            return None
+
+        if not allow_path and (
+            parsed.path or parsed.query or parsed.fragment
+        ):
+            return None
+
+        hostname = parsed.hostname.lower()
+        port = parsed.port
+
+        if ":" in hostname and not hostname.startswith("["):
+            hostname = f"[{hostname}]"
+
+        if (scheme == "http" and port == 80) or (
+            scheme == "https" and port == 443
+        ):
+            port = None
+
+        authority = hostname if port is None else f"{hostname}:{port}"
+
+        return f"{scheme}://{authority}"
+
+    except (ValueError, AttributeError):
+        return None
 
 
-CORS(app, resources={
-    r"/api/*" : {
-        "origins" : ALLOWED_ORIGINS,
-        "methods" : ["GET", "POST", "OPTIONS"],
-        "allow_headers" : ["Content-Type", "x-api-key"]
+ALLOWED_ORIGINS = {
+    origin
+    for origin in (
+        normalize_origin(item.strip())
+        for item in os.getenv(
+            "ALLOWED_ORIGINS",
+            "http://localhost:8080"
+        ).split(",")
+        if item.strip()
+    )
+    if origin
+}
+
+if not ALLOWED_ORIGINS:
+    raise RuntimeError("ALLOWED_ORIGINS chưa được cấu hình hợp lệ.")
+
+CORS(
+    app,
+    resources={
+        r"/api/*": {
+            "origins": list(ALLOWED_ORIGINS),
+            "methods": ["GET", "POST", "OPTIONS"],
+            "allow_headers": ["Content-Type"]
+        }
     }
-})
+)
+
+RATE_LIMIT_SCRIPT = redis_client.register_script(
+    """
+    local current = redis.call('INCR', KEYS[1])
+    local ttl = redis.call('TTL', KEYS[1])
+
+    if ttl == -1 then
+        redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
+        ttl = tonumber(ARGV[1])
+    end
+
+    return {current, ttl}
+    """
+)
 
 
-SQLI_PATTERN = re.compile(r"(?i)(\b(SELECT|UPDATE|DELETE|INSERT|DROP|ALTER|UNION)\b)")
-NOSQLI_PATTERN = re.compile(r"(?i)(\$gt|\$lt|\$ne|\$where|\$regex)")
+def get_client_ip():
+    remote_addr = request.remote_addr
 
-
-XSS_PATTERN = re.compile(r"(?i)(<script[^>]*>|javascript:|on\w+\s*=)")
-
-
-BLACKLIST_IPS = set()
-BAD_USER_AGENTS = ["sqlmap", "nmap", "zgrab", "nikto", "curl", "python-requests"]
-
-def get_real_ip():
-    forwarded_for = request.headers.get('X-Forwarded-For')
-    if forwarded_for:
-        return forwarded_for.split(',')[0].strip()
-    return request.remote_addr
-
-@app.before_request
-def check_rate_limit():
-    if request.method == 'OPTIONS':
+    if not remote_addr:
         return None
 
-    client_ip = get_real_ip()
-
-    #firewall
-    if client_ip in BLACKLIST_IPS:
-        return jsonify({"error": "Truy cập bị từ chối bởi Tường lửa (IP Banned)."}), 403
-
-    user_agent = request.headers.get('User-Agent', '').lower()
-    for bad_bot in BAD_USER_AGENTS:
-        if bad_bot in user_agent:
-            return jsonify({"error": "Phát hiện công cụ truy cập không hợp lệ."}), 403
-
-    #CSRF
-    if request.method in ['POST', 'PUT', 'DELETE', 'PATCH']:
-        origin = request.headers.get('Origin')
-        referer = request.headers.get('Referer')
-
-        if origin and origin not in ALLOWED_ORIGINS:
-            return jsonify({"error": "Lỗi CSRF: Nguồn gốc request không hợp lệ."}), 403
-
-        if referer and not any (referer.startswith(allowed) for allowed in ALLOWED_ORIGINS):
-            return jsonify({"error": "Lỗi CSRF: Nguồn gốc request không hợp lệ."}), 403
-
-    def contains_malicious_payload(text):
-        if SQLI_PATTERN.search(text) or NOSQLI_PATTERN.search(text):
-            return "Injection"
-        if XSS_PATTERN.search(text):
-            return "XSS"
+    try:
+        return ipaddress.ip_address(remote_addr).compressed
+    except ValueError:
         return None
 
-    # Quét tham số trên URL
-    for key, value in request.args.items():
-        threat = contains_malicious_payload(value)
-        if threat:
-            return jsonify({"error": "Phát hiện mã độc Injection trong URL"}), 403
 
-    # Quét dữ liệu trong Body
-    if request.is_json:
-        body_str = request.get_data(as_text=True)
-        threat = contains_malicious_payload(body_str)
-        if threat:
-            return jsonify({"error": "Phát hiện mã độc Injection trong Body!"}), 403
+def is_valid_request_origin():
+    origin = request.headers.get("Origin")
 
-    api_key = request.headers.get('x-api-key')
-    client_id = api_key if api_key else client_ip #địa chỉ ip của client gửi request
-    #ý nghĩa dòng trên là Ưu tiên nhận diện người dùng bằng API Key. Nếu không có API Key thì nhận diện bằng IP
-
-
-    current_time = time.time()
-    #trường hợp nếu user mới tạo request đầu
-    if client_id not in rate_limit_storage:
-        rate_limit_storage[client_id] = {"count": 1, "start_time": current_time}
-        return None     #Cho phép request đi tiếp
-
-
-    user_record = rate_limit_storage[client_id]
-    time_passed = current_time - user_record["start_time"]
-
-
-    if time_passed > TIME_WINDOW:
-        user_record["count"] = 1
-        user_record["start_time"] = current_time
+    if origin is not None:
+        normalized_origin = normalize_origin(origin)
     else:
-        user_record["count"] += 1
-        if user_record["count"] > MAX_REQUESTS:
-            return jsonify({
-                "error": "Too many request. Máy chủ đang bận",
-                "Vui lòng thử lại sau" : round(TIME_WINDOW - time_passed, 1)
-            }), 429
+        referer = request.headers.get("Referer")
+
+        if not referer:
+            return False
+
+        normalized_origin = normalize_origin(
+            referer,
+            allow_path=True
+        )
+
+    return (
+        normalized_origin is not None
+        and normalized_origin in ALLOWED_ORIGINS
+    )
+
+
+def apply_rate_limit(client_ip):
+    ip_hash = hashlib.sha256(
+        client_ip.encode("utf-8")
+    ).hexdigest()
+
+    redis_key = f"rate_limit:ip:{ip_hash}"
+
+    result = RATE_LIMIT_SCRIPT(
+        keys=[redis_key],
+        args=[TIME_WINDOW]
+    )
+
+    current_count = int(result[0])
+    ttl = int(result[1])
+
+    if current_count > MAX_REQUESTS:
+        retry_after = max(ttl, 1)
+
+        response = jsonify({
+            "error": "Too many requests.",
+            "retry_after_seconds": retry_after
+        })
+
+        response.status_code = 429
+        response.headers["Retry-After"] = str(retry_after)
+
+        return response
 
     return None
 
+
+@app.before_request
+def security_middleware():
+    client_ip = get_client_ip()
+
+    if client_ip is None:
+        return jsonify({
+            "error": "Không xác định được địa chỉ client."
+        }), 400
+
+    try:
+        if redis_client.sismember("blacklist_ips", client_ip):
+            return jsonify({
+                "error": "Truy cập bị từ chối."
+            }), 403
+
+        rate_limit_response = apply_rate_limit(client_ip)
+
+        if rate_limit_response is not None:
+            return rate_limit_response
+
+    except redis.RedisError as exc:
+        app.logger.error(
+            "Redis request failed: %s",
+            type(exc).__name__
+        )
+
+        return jsonify({
+            "error": "Dịch vụ bảo vệ hiện không khả dụng."
+        }), 503
+
+    if (
+        request.method in STATE_CHANGING_METHODS
+        and not is_valid_request_origin()
+    ):
+        return jsonify({
+            "error": "Nguồn gốc request không hợp lệ."
+        }), 403
+
+    return None
+
+
 @app.after_request
 def add_security_headers(response):
-    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
 
-    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "object-src 'none'; "
+        "base-uri 'self'; "
+        "frame-ancestors 'none';"
+    )
+
+    response.headers["Referrer-Policy"] = (
+        "strict-origin-when-cross-origin"
+    )
+
+    response.headers["Permissions-Policy"] = (
+        "camera=(), microphone=(), geolocation=()"
+    )
+
+    response.headers["Cache-Control"] = "no-store"
+
+    if request.is_secure:
+        response.headers["Strict-Transport-Security"] = (
+            "max-age=31536000"
+        )
+
     return response
 
-@app.route('/api/data', methods = ['GET'])
+
+@app.route("/api/data", methods=["GET"])
 def get_data():
-    return jsonify({"message" : "Lấy dữ liệu thành công! Request hợp lệ."}), 200
+    return jsonify({
+        "message": "Lấy dữ liệu thành công! Request hợp lệ."
+    }), 200
 
 
-if __name__ == '__main__':
-    app.run(debug=True)
+if __name__ == "__main__":
+    app.run(
+        host="127.0.0.1",
+        port=int(os.getenv("PORT", "5000")),
+        debug=False,
+        use_reloader=False
+    )

@@ -1,84 +1,152 @@
-🛡️ 7-Layer API Security Middleware
+# Flask Security Middleware
 
-📌 Giới thiệu (Overview)
+Project học tập về middleware bảo mật cho API sử dụng Flask, Redis và Werkzeug. Mục tiêu là thực hành các lớp kiểm soát request cơ bản và hiểu giới hạn của chúng.
 
-Đây là một hệ thống Middleware bảo mật chuyên sâu dành cho các Web API, được xây dựng bằng Python/Flask. Dự án này áp dụng mô hình phòng thủ nhiều lớp (Defense in Depth), hoạt động ở Tầng ứng dụng (Layer 7) nhằm bảo vệ máy chủ khỏi các cuộc tấn công phổ biến, spam lưu lượng và khai thác lỗ hổng.
+## Chức năng hiện có
 
-🚀 Các tính năng bảo mật cốt lõi (The 7 Defense Layers)
+- **ProxyFix:** đọc thông tin IP và giao thức từ header proxy khi được cấu hình số proxy tin cậy chính xác.
+- **Rate Limiting:** giới hạn mặc định 5 request trong 10 giây theo IP client; bộ đếm được lưu trong Redis.
+- **Atomic counter và TTL:** Lua script gom thao tác tăng bộ đếm và thiết lập TTL trong Redis.
+- **IP Blacklist:** từ chối IP có trong Redis Set `blacklist_ips`.
+- **CORS:** chỉ cho phép origin được cấu hình truy cập tài nguyên `/api/*`.
+- **Kiểm tra Origin/Referer:** từ chối request thay đổi trạng thái nếu nguồn gốc không hợp lệ hoặc bị thiếu.
+- **Security Headers:** thêm các header như `X-Content-Type-Options`, `X-Frame-Options`, CSP, `Referrer-Policy`, `Permissions-Policy` và `Cache-Control`; HSTS chỉ được thêm khi request được nhận diện là HTTPS.
 
-Hệ thống xử lý mọi Request đi vào thông qua một phễu lọc gồm 7 lớp:
+## Công nghệ
 
-1. Firewall (IP & Bot Protection):
+- Python 3.10 trở lên
+- Flask 3.1.3
+- Flask-Cors 6.0.5
+- Redis server
+- redis-py 8.1.0
+- Werkzeug 3.1.9
 
-Lọc và chặn ngay lập tức các IP nằm trong Blacklist.
+## Cấu trúc tối thiểu
 
-Nhận diện và chặn các công cụ rà quét tự động (Bots/Scanners) thông qua User-Agent (ví dụ: sqlmap, nmap, curl).
+```text
+project/
+├── app.py
+├── requirements.txt
+└── README.md
+```
 
-Tích hợp trích xuất IP thật (True Client IP) đằng sau các hệ thống Reverse Proxy như Cloudflare hoặc AWS API Gateway (X-Forwarded-For).
+Lưu mã Flask hiện tại vào `app.py`. Nếu file có tên khác, thay `app.py` trong các lệnh chạy bên dưới bằng tên module tương ứng.
 
-2. CORS Management (Cross-Origin Resource Sharing):
+## Cài đặt trên Windows
 
-Kiểm soát nghiêm ngặt các nguồn (Origins) được phép gọi API.
+### 1. Tạo môi trường Python
 
-Xử lý mượt mà các OPTIONS Preflight requests để tương thích với trình duyệt.
+Mở PowerShell tại thư mục project:
 
-3. Anti-CSRF (Cross-Site Request Forgery):
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
 
-Xác thực nguồn gốc của các requests có tính chất thay đổi dữ liệu (POST, PUT, DELETE) thông qua headers Origin và Referer.
+Nếu PowerShell không cho phép kích hoạt môi trường ảo, có thể gọi trực tiếp `\.venv\Scripts\python.exe` thay vì thay đổi chính sách thực thi toàn máy.
 
-4. WAF: SQL & NoSQL Injection Scanner:
+### 2. Khởi động Redis
 
-Quét toàn bộ URL Parameters và JSON Body.
+Nếu đã cài Redis, hãy đảm bảo Redis đang chạy tại `localhost:6379`.
 
-Sử dụng Regex để đánh chặn sớm các payload chứa từ khóa SQL nguy hiểm (UNION SELECT, DROP) hoặc toán tử NoSQL ($gt, $ne).
+Hoặc sử dụng Docker Desktop:
 
-5. WAF: XSS Filter (Cross-Site Scripting):
+```powershell
+docker run --name flask-security-redis -p 127.0.0.1:6379:6379 -d redis:8
+docker exec flask-security-redis redis-cli ping
+```
 
-Lọc và chặn các requests cố tình chèn thẻ <script>, các sự kiện JS (onerror, onload) trước khi chúng kịp đi vào Database.
+Kết quả kiểm tra mong đợi là `PONG`. Nếu container đã tồn tại, dùng `docker start flask-security-redis` thay vì tạo lại.
 
-6. Rate Limiting (Fixed Window Counter):
+### 3. Cấu hình môi trường
 
-Ngăn chặn tấn công Brute-force và HTTP Flood (Application DDoS).
+Chạy trong cùng cửa sổ PowerShell sẽ khởi động ứng dụng:
 
-Ưu tiên nhận diện người dùng qua x-api-key. Nếu không có, tự động chuyển sang giới hạn theo IP thật.
+```powershell
+$env:REDIS_URL = "redis://localhost:6379/0"
+$env:ALLOWED_ORIGINS = "http://localhost:8080"
+$env:MAX_REQUESTS = "5"
+$env:TIME_WINDOW = "10"
+$env:TRUSTED_X_FOR_COUNT = "0"
+$env:TRUSTED_X_PROTO_COUNT = "0"
+$env:PORT = "5000"
+```
 
-Trả về mã lỗi chuẩn 429 Too Many Requests kèm thời gian chờ (retry_after_seconds).
+`ALLOWED_ORIGINS` nhận danh sách origin phân tách bằng dấu phẩy, ví dụ `http://localhost:8080,https://example.com`. Chỉ khai báo những origin bạn thực sự tin cậy.
 
-7. Security Headers (Lớp giáp đầu ra):
+Ở môi trường local không có reverse proxy, giữ `TRUSTED_X_FOR_COUNT=0` và `TRUSTED_X_PROTO_COUNT=0`. Chỉ đặt giá trị lớn hơn 0 khi ứng dụng nằm sau proxy đáng tin cậy đã được cấu hình để ghi đè/chuẩn hóa các header chuyển tiếp. Không mở cổng ứng dụng trực tiếp ra Internet khi đang tin header do proxy chuyển tiếp.
 
-Tự động đính kèm các headers bảo vệ trình duyệt người dùng ở mọi responses (như X-Content-Type-Options: nosniff, X-Frame-Options: DENY).
+Không đưa mật khẩu Redis hoặc thông tin bí mật vào Git. Nếu Redis có mật khẩu, hãy đặt thông tin kết nối trong biến `REDIS_URL` của môi trường triển khai.
 
-🛠️ Công nghệ sử dụng (Tech Stack)
+### 4. Chạy ứng dụng
 
-Ngôn ngữ: Python 3.x
-
-Framework: Flask
-
-Thư viện: Flask-CORS, re (Regular Expressions), time
-
-⚙️ Hướng dẫn chạy thử (Installation & Usage)
-
-1. Clone kho lưu trữ này về máy:
-
-git clone https://github.com/Dmeo2051612/Tool-b-o-m-t-API.git
-
-
-2. Cài đặt các thư viện cần thiết:
-
-pip install Flask Flask-Cors
-
-
-3. Khởi chạy máy chủ:
-
+```powershell
 python app.py
+```
 
+Ứng dụng chạy tại `http://127.0.0.1:5000` theo cấu hình mặc định.
 
-4. Hệ thống sẽ lắng nghe ở cổng 5000. Bạn có thể dùng Postman hoặc trình duyệt để gọi vào http://127.0.0.1:5000/api/data và test thử các chức năng chặn mã độc, rate limit.
+## API mẫu
 
-💡 Hướng phát triển tương lai (Future Roadmap)
+### `GET /api/data`
 
-[ ] Tích hợp Caching (Redis) để thay thế cho Dictionary trong RAM, giúp scale hệ thống ra nhiều server.
+```powershell
+curl.exe -i http://127.0.0.1:5000/api/data
+```
 
-[ ] Tích hợp API kiểm tra IP ảo (VPN/Proxy/Tor Detection).
+Request thành công trả về JSON tương tự:
 
-[ ] Xây dựng Dashboard để theo dõi lưu lượng và cảnh báo tấn công theo thời gian thực.
+```json
+{
+  "message": "Lấy dữ liệu thành công! Request hợp lệ."
+}
+```
+
+### Kiểm tra Rate Limiting
+
+Mặc định, mỗi IP được phép 5 request trong một cửa sổ 10 giây. Gửi 6 request liên tiếp:
+
+```powershell
+1..6 | ForEach-Object {
+    curl.exe -s -o NUL -w "%{http_code}`n" http://127.0.0.1:5000/api/data
+}
+```
+
+Sau khi vượt giới hạn, request sẽ nhận HTTP `429`. Chờ TTL hết hạn rồi thử lại.
+
+### Thêm hoặc gỡ IP khỏi blacklist
+
+Thêm IP vào blacklist:
+
+```powershell
+docker exec flask-security-redis redis-cli SADD blacklist_ips 127.0.0.1
+```
+
+Gỡ IP khỏi blacklist:
+
+```powershell
+docker exec flask-security-redis redis-cli SREM blacklist_ips 127.0.0.1
+```
+
+Các lệnh trên áp dụng khi dùng container Redis có tên `flask-security-redis`. Nếu đang chạy Redis theo cách khác, dùng công cụ Redis tương ứng. Blacklist hiện lưu địa chỉ IP gốc, không phải giá trị hash.
+
+## Hành vi khi Redis không khả dụng
+
+Middleware hiện dùng chính sách **Fail-Closed**: nếu lệnh Redis phát sinh lỗi, request nhận HTTP `503 Service Unavailable`. Code hiện tại chưa có Circuit Breaker, bản sao Redis, hoặc cơ chế fallback trong RAM.
+
+## Giới hạn và phạm vi sử dụng
+
+Đây là middleware mẫu phục vụ học tập và kiểm thử, **chưa phải API Gateway hoàn chỉnh và chưa đủ điều kiện tự thân để triển khai làm lớp bảo vệ cho ứng dụng tài chính**.
+
+- Ứng dụng chỉ có endpoint minh họa `GET /api/data`; chưa chuyển tiếp request đến backend khác.
+- Chưa triển khai Authentication/Authorization, JWT, quản lý user ID hay giới hạn request theo danh tính người dùng. Rate Limit hiện chỉ dựa trên IP.
+- SHA-256 được dùng để tạo key Rate Limit, nhưng điều đó không tự động bảo đảm tuân thủ GDPR hoặc làm dữ liệu IP hoàn toàn ẩn danh. Blacklist vẫn chứa IP dạng rõ.
+- WAF bên ngoài như Cloudflare hoặc ModSecurity chưa được cấu hình trong project này.
+- Kiểm tra Origin/Referer không thay thế Authentication, Authorization hoặc toàn bộ biện pháp CSRF cần thiết cho một ứng dụng có phiên đăng nhập.
+- Redis vẫn là thành phần phụ thuộc tập trung; khi Redis lỗi, request bị từ chối với HTTP 503.
+- Rate Limiting theo IP không đủ để ngăn mọi loại DoS/DDoS và không thay thế kiểm soát tài nguyên ở tầng hạ tầng.
+- `python app.py` dùng server phát triển của Flask; không dùng cách chạy này cho production. Khi triển khai, cần WSGI server phù hợp, HTTPS, cấu hình proxy chính xác, giám sát, quản lý secret và kiểm thử bảo mật.
+
+Với ứng dụng quản lý chi tiêu, nên đặt nghiệp vụ giao dịch, phân quyền và tính nhất quán dữ liệu trong backend chính (ví dụ Spring Boot + SQL Server). Chỉ bổ sung Flask làm gateway nếu có yêu cầu định tuyến và vận hành rõ ràng.
